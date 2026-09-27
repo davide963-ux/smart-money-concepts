@@ -36,7 +36,10 @@ namespace cAlgo.Robots
         [Parameter("Breakeven Trigger ($ profit, 0 = off)", DefaultValue = 500, MinValue = 0, Group = "Risk")]
         public double BreakEvenTriggerUsd { get; set; }
 
-        [Parameter("Use Trend Filter", DefaultValue = true, Group = "Trend Filter")]
+        [Parameter("Max Hold (days, 0 = off)", DefaultValue = 5, MinValue = 0, Group = "Risk")]
+        public int MaxHoldDays { get; set; }
+
+        [Parameter("Use Trend Filter", DefaultValue = false, Group = "Trend Filter")]
         public bool UseTrendFilter { get; set; }
 
         [Parameter("Trend Timeframe", DefaultValue = "Daily", Group = "Trend Filter")]
@@ -154,6 +157,20 @@ namespace cAlgo.Robots
             }
         }
 
+        // Turns this into a day-trading bot: no position survives past
+        // MaxHoldDays regardless of what the signal is doing, win or lose.
+        private void CheckMaxHold()
+        {
+            if (_currentPosition == null || MaxHoldDays <= 0) return;
+
+            if (Server.Time - _currentPosition.EntryTime >= TimeSpan.FromDays(MaxHoldDays))
+            {
+                Print("MaxHold: closing position {0}, held since {1}", _currentPosition.Id, _currentPosition.EntryTime);
+                ClosePosition(_currentPosition);
+                _currentPosition = null;
+            }
+        }
+
         private void OnBarOpened(BarOpenedEventArgs args)
         {
             int closedIndex = Bars.Count - 2;
@@ -261,6 +278,7 @@ namespace cAlgo.Robots
         private void ExecuteSignal()
         {
             SyncPosition();
+            CheckMaxHold();
             TradeType? desiredType = _desiredDirection == 1 ? TradeType.Buy : _desiredDirection == -1 ? TradeType.Sell : (TradeType?)null;
 
             // trend filter only blocks NEW entries against the higher-TF trend;
