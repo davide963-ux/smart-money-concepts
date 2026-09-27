@@ -152,16 +152,28 @@ namespace cAlgo.Robots
             _pending = null;
         }
 
+        // Closes every stray/wrong-direction position under our label and opens
+        // the desired one if it isn't already held - can't pyramid, since it
+        // reconciles against the broker's actual position list every bar
+        // instead of trusting a direction-filtered lookup.
         private void ExecuteSignal()
         {
-            var longPos = Positions.FirstOrDefault(x => x.SymbolName == SymbolName && x.Label == BotLabel && x.TradeType == TradeType.Buy);
-            var shortPos = Positions.FirstOrDefault(x => x.SymbolName == SymbolName && x.Label == BotLabel && x.TradeType == TradeType.Sell);
+            var positions = Positions.Where(x => x.SymbolName == SymbolName && x.Label == BotLabel).ToList();
+            TradeType? desiredType = _desiredDirection == 1 ? TradeType.Buy : _desiredDirection == -1 ? TradeType.Sell : (TradeType?)null;
 
-            if (_desiredDirection == 1 && shortPos != null) ClosePosition(shortPos);
-            if (_desiredDirection == -1 && longPos != null) ClosePosition(longPos);
+            bool alreadyCorrect = false;
+            foreach (var p in positions)
+            {
+                if (desiredType.HasValue && p.TradeType == desiredType.Value && !alreadyCorrect)
+                {
+                    alreadyCorrect = true;
+                    continue;
+                }
+                ClosePosition(p);
+            }
 
-            if (_desiredDirection == 1 && longPos == null) OpenTrade(TradeType.Buy);
-            if (_desiredDirection == -1 && shortPos == null) OpenTrade(TradeType.Sell);
+            if (desiredType.HasValue && !alreadyCorrect)
+                OpenTrade(desiredType.Value);
         }
 
         private void OpenTrade(TradeType type)
