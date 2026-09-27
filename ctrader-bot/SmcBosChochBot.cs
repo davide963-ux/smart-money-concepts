@@ -36,6 +36,9 @@ namespace cAlgo.Robots
         [Parameter("Breakeven Trigger ($ profit, 0 = off)", DefaultValue = 500, MinValue = 0, Group = "Risk")]
         public double BreakEvenTriggerUsd { get; set; }
 
+        [Parameter("Trailing Lock % of peak profit (0 = off)", DefaultValue = 10.0, MinValue = 0, Group = "Risk")]
+        public double TrailingLockPercent { get; set; }
+
         [Parameter("Max Hold (days, 0 = off)", DefaultValue = 5, MinValue = 0, Group = "Risk")]
         public int MaxHoldDays { get; set; }
 
@@ -52,7 +55,8 @@ namespace cAlgo.Robots
         private AverageTrueRange _atr;
         private Bars _trendBars;
         private MovingAverage _trendEma;
-        private bool _breakEvenApplied;
+        private double _peakProfit;
+        private double _lockedProfitUsd = double.NegativeInfinity; // highest profit level the SL currently guarantees
 
         private enum SwingType { High = 1, Low = -1 }
 
@@ -102,22 +106,37 @@ namespace cAlgo.Robots
         }
 
         // Checked every tick (not just per-bar close) so a profit spike mid-bar
-        // isn't missed before it reverses. Moves SL to exact entry price once
-        // floating profit crosses the trigger - note this ignores spread, so a
-        // fill right at entry can still cost a few points net.
+        // isn't missed before it reverses. Combines two rules into one ratchet:
+        // breakeven once profit crosses BreakEvenTriggerUsd (locks $0), and a
+        // trailing lock of TrailingLockPercent of the highest profit ever seen
+        // on this position (locks progressively more as profit grows). Whichever
+        // of the two currently guarantees more is applied; the stop only ever
+        // moves to lock in MORE profit, never less - this ignores spread, so a
+        // fill right at the locked level can still cost a few points net.
         protected override void OnTick()
         {
-            if (_currentPosition == null || _breakEvenApplied || BreakEvenTriggerUsd <= 0)
-                return;
+            if (_currentPosition == null) return;
 
-            if (_currentPosition.NetProfit >= BreakEvenTriggerUsd)
+            double profit = _currentPosition.NetProfit;
+            _peakProfit = Math.Max(_peakProfit, profit);
+
+            double desiredLock = double.NegativeInfinity;
+            if (BreakEvenTriggerUsd > 0 && profit >= BreakEvenTriggerUsd)
+                desiredLock = Math.Max(desiredLock, 0.0);
+            if (TrailingLockPercent > 0 && _peakProfit > 0)
+                desiredLock = Math.Max(desiredLock, _peakProfit * TrailingLockPercent / 100.0);
+
+            if (double.IsNegativeInfinity(desiredLock) || desiredLock <= _lockedProfitUsd)
+                return; // nothing more protective to apply yet
+
+            int direction = _currentPosition.TradeType == TradeType.Buy ? 1 : -1;
+            double lockPrice = _currentPosition.EntryPrice + (desiredLock / _currentPosition.VolumeInUnits) * direction;
+
+            var result = _currentPosition.ModifyStopLossPrice(lockPrice);
+            if (result.IsSuccessful)
             {
-                var result = _currentPosition.ModifyStopLossPrice(_currentPosition.EntryPrice);
-                if (result.IsSuccessful)
-                {
-                    _breakEvenApplied = true;
-                    Print("Breakeven: moved SL to entry {0} for position {1}", _currentPosition.EntryPrice, _currentPosition.Id);
-                }
+                _lockedProfitUsd = desiredLock;
+                Print("ProfitLock: SL moved to lock ${0:F2} (peak profit ${1:F2}) for position {2}", desiredLock, _peakProfit, _currentPosition.Id);
             }
         }
 
@@ -152,7 +171,8 @@ namespace cAlgo.Robots
                 {
                     Print("SyncPosition: adopting untracked position {0} ({1})", adopted.Id, adopted.TradeType);
                     _currentPosition = adopted;
-                    _breakEvenApplied = false;
+                    _peakProfit = 0;
+                    _lockedProfitUsd = double.NegativeInfinity;
                 }
             }
         }
@@ -319,7 +339,8 @@ namespace cAlgo.Robots
             if (result.IsSuccessful)
             {
                 _currentPosition = result.Position;
-                _breakEvenApplied = false;
+                _peakProfit = 0;
+                _lockedProfitUsd = double.NegativeInfinity;
             }
         }
     }
