@@ -2,12 +2,16 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using cAlgo.API;
+using cAlgo.API.Indicators;
 
 namespace cAlgo.Robots
 {
     // Ports the same always-in-market BOS/CHOCH flip used by
     // backtest/strategy.py's bos_choch_strategy(), driven by the same
     // swing_highs_lows + bos_choch pattern logic as smartmoneyconcepts/smc.py.
+    // Position sizing and stop distance mirror backtest/engine.py: risk a fixed
+    // % of account balance per trade, stop distance = ATR * multiplier - not an
+    // arbitrary % of price.
     [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
     public class SmcBosChochBot : Robot
     {
@@ -17,16 +21,20 @@ namespace cAlgo.Robots
         [Parameter("Close Break", DefaultValue = true, Group = "Structure")]
         public bool CloseBreak { get; set; }
 
-        [Parameter("Volume (units)", DefaultValue = 100000, MinValue = 1000, Group = "Risk")]
-        public double VolumeInUnits { get; set; }
+        [Parameter("Risk % per trade", DefaultValue = 0.5, MinValue = 0.01, Group = "Risk")]
+        public double RiskPercent { get; set; }
 
-        [Parameter("Stop Loss %", DefaultValue = 0.0, MinValue = 0, Group = "Risk")]
-        public double StopLossPct { get; set; }
+        [Parameter("ATR Period", DefaultValue = 14, MinValue = 2, Group = "Risk")]
+        public int AtrPeriod { get; set; }
 
-        [Parameter("Take Profit %", DefaultValue = 0.0, MinValue = 0, Group = "Risk")]
-        public double TakeProfitPct { get; set; }
+        [Parameter("ATR Multiplier (stop distance)", DefaultValue = 2.0, MinValue = 0.1, Group = "Risk")]
+        public double AtrMultiplier { get; set; }
+
+        [Parameter("Reward:Risk ratio (0 = no TP, rely on flip)", DefaultValue = 0.0, MinValue = 0, Group = "Risk")]
+        public double RewardRiskRatio { get; set; }
 
         private const string BotLabel = "SmcBosChoch";
+        private AverageTrueRange _atr;
 
         private enum SwingType { High = 1, Low = -1 }
 
@@ -49,6 +57,7 @@ namespace cAlgo.Robots
 
         protected override void OnStart()
         {
+            _atr = Indicators.AverageTrueRange(AtrPeriod, MovingAverageType.WilderSmoothing);
             Bars.BarOpened += OnBarOpened;
         }
 
@@ -176,13 +185,21 @@ namespace cAlgo.Robots
                 OpenTrade(desiredType.Value);
         }
 
+        // Stop distance = ATR * multiplier, position size = (balance * risk%) / stop
+        // distance - fixed dollar risk per trade regardless of current volatility,
+        // instead of a stop expressed as a % of price.
         private void OpenTrade(TradeType type)
         {
-            double volume = Symbol.NormalizeVolumeInUnits(VolumeInUnits);
-            double price = type == TradeType.Buy ? Symbol.Ask : Symbol.Bid;
+            double atrValue = _atr.Result[Bars.Count - 2];
+            if (double.IsNaN(atrValue) || atrValue <= 0)
+                return; // not enough history yet to size a stop
 
-            double? slPips = StopLossPct > 0 ? price * StopLossPct / 100.0 / Symbol.PipSize : (double?)null;
-            double? tpPips = TakeProfitPct > 0 ? price * TakeProfitPct / 100.0 / Symbol.PipSize : (double?)null;
+            double stopDistance = atrValue * AtrMultiplier;
+            double riskAmount = Account.Balance * RiskPercent / 100.0;
+            double volume = Symbol.NormalizeVolumeInUnits(riskAmount / stopDistance);
+
+            double slPips = stopDistance / Symbol.PipSize;
+            double? tpPips = RewardRiskRatio > 0 ? stopDistance * RewardRiskRatio / Symbol.PipSize : (double?)null;
 
             ExecuteMarketOrder(type, SymbolName, volume, BotLabel, slPips, tpPips);
         }

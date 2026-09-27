@@ -15,9 +15,10 @@ def main():
     parser.add_argument("--csv", default=DEFAULT_CSV, help="OHLCV CSV with a Date column")
     parser.add_argument("--swing-length", type=int, default=5)
     parser.add_argument("--initial-balance", type=float, default=10_000.0)
-    parser.add_argument("--position-size", type=float, default=1.0)
-    parser.add_argument("--stop-loss-pct", type=float, default=None)
-    parser.add_argument("--take-profit-pct", type=float, default=None)
+    parser.add_argument("--risk-pct", type=float, default=0.5, help="Equity %% risked per trade")
+    parser.add_argument("--atr-period", type=int, default=14)
+    parser.add_argument("--atr-multiplier", type=float, default=2.0, help="Stop distance = ATR * this")
+    parser.add_argument("--reward-risk-ratio", type=float, default=None, help="Take profit = stop distance * this (unset = no TP, rely on signal flip)")
     parser.add_argument("--plot", action="store_true", help="Save an equity curve PNG (requires matplotlib)")
     args = parser.parse_args()
 
@@ -27,9 +28,10 @@ def main():
     engine = BacktestEngine(
         ohlc,
         initial_balance=args.initial_balance,
-        position_size=args.position_size,
-        stop_loss_pct=args.stop_loss_pct,
-        take_profit_pct=args.take_profit_pct,
+        risk_pct=args.risk_pct,
+        atr_period=args.atr_period,
+        atr_multiplier=args.atr_multiplier,
+        reward_risk_ratio=args.reward_risk_ratio,
     )
     result = engine.run(signal)
 
