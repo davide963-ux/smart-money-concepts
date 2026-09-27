@@ -33,8 +33,12 @@ namespace cAlgo.Robots
         [Parameter("Reward:Risk ratio (0 = no TP, rely on flip)", DefaultValue = 0.0, MinValue = 0, Group = "Risk")]
         public double RewardRiskRatio { get; set; }
 
+        [Parameter("Breakeven Trigger ($ profit, 0 = off)", DefaultValue = 500, MinValue = 0, Group = "Risk")]
+        public double BreakEvenTriggerUsd { get; set; }
+
         private const string BotLabel = "SmcBosChoch";
         private AverageTrueRange _atr;
+        private bool _breakEvenApplied;
 
         private enum SwingType { High = 1, Low = -1 }
 
@@ -61,6 +65,26 @@ namespace cAlgo.Robots
             _atr = Indicators.AverageTrueRange(AtrPeriod, MovingAverageType.WilderSmoothing);
             Bars.BarOpened += OnBarOpened;
             Positions.Closed += OnPositionClosed;
+        }
+
+        // Checked every tick (not just per-bar close) so a profit spike mid-bar
+        // isn't missed before it reverses. Moves SL to exact entry price once
+        // floating profit crosses the trigger - note this ignores spread, so a
+        // fill right at entry can still cost a few points net.
+        protected override void OnTick()
+        {
+            if (_currentPosition == null || _breakEvenApplied || BreakEvenTriggerUsd <= 0)
+                return;
+
+            if (_currentPosition.NetProfit >= BreakEvenTriggerUsd)
+            {
+                var result = _currentPosition.ModifyStopLossPrice(_currentPosition.EntryPrice);
+                if (result.IsSuccessful)
+                {
+                    _breakEvenApplied = true;
+                    Print("Breakeven: moved SL to entry {0} for position {1}", _currentPosition.EntryPrice, _currentPosition.Id);
+                }
+            }
         }
 
         // Catches SL/TP-triggered closes (not initiated by our own ClosePosition
@@ -94,6 +118,7 @@ namespace cAlgo.Robots
                 {
                     Print("SyncPosition: adopting untracked position {0} ({1})", adopted.Id, adopted.TradeType);
                     _currentPosition = adopted;
+                    _breakEvenApplied = false;
                 }
             }
         }
@@ -236,7 +261,10 @@ namespace cAlgo.Robots
 
             var result = ExecuteMarketOrder(type, SymbolName, volume, BotLabel, slPips, tpPips);
             if (result.IsSuccessful)
+            {
                 _currentPosition = result.Position;
+                _breakEvenApplied = false;
+            }
         }
     }
 }
