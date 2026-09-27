@@ -54,11 +54,21 @@ namespace cAlgo.Robots
         private readonly List<SwingPoint> _swings = new List<SwingPoint>();
         private PendingStructure _pending;
         private int _desiredDirection; // -1, 0, 1
+        private Position _currentPosition; // the exact position this bot opened, or null
 
         protected override void OnStart()
         {
             _atr = Indicators.AverageTrueRange(AtrPeriod, MovingAverageType.WilderSmoothing);
             Bars.BarOpened += OnBarOpened;
+            Positions.Closed += OnPositionClosed;
+        }
+
+        // Catches SL/TP-triggered closes (not initiated by our own ClosePosition
+        // call) so _currentPosition never goes stale and causes a duplicate open.
+        private void OnPositionClosed(PositionClosedEventArgs args)
+        {
+            if (_currentPosition != null && args.Position.Id == _currentPosition.Id)
+                _currentPosition = null;
         }
 
         private void OnBarOpened(BarOpenedEventArgs args)
@@ -161,27 +171,21 @@ namespace cAlgo.Robots
             _pending = null;
         }
 
-        // Closes every stray/wrong-direction position under our label and opens
-        // the desired one if it isn't already held - can't pyramid, since it
-        // reconciles against the broker's actual position list every bar
-        // instead of trusting a direction-filtered lookup.
+        // Uses _currentPosition (the exact object handed back by our own order
+        // execution) instead of re-querying Positions by symbol/label/direction -
+        // a live run showed that lookup missing an existing position and
+        // pyramiding into duplicates. Object identity can't produce a false miss.
         private void ExecuteSignal()
         {
-            var positions = Positions.Where(x => x.SymbolName == SymbolName && x.Label == BotLabel).ToList();
             TradeType? desiredType = _desiredDirection == 1 ? TradeType.Buy : _desiredDirection == -1 ? TradeType.Sell : (TradeType?)null;
 
-            bool alreadyCorrect = false;
-            foreach (var p in positions)
+            if (_currentPosition != null && (!desiredType.HasValue || _currentPosition.TradeType != desiredType.Value))
             {
-                if (desiredType.HasValue && p.TradeType == desiredType.Value && !alreadyCorrect)
-                {
-                    alreadyCorrect = true;
-                    continue;
-                }
-                ClosePosition(p);
+                ClosePosition(_currentPosition);
+                _currentPosition = null;
             }
 
-            if (desiredType.HasValue && !alreadyCorrect)
+            if (desiredType.HasValue && _currentPosition == null)
                 OpenTrade(desiredType.Value);
         }
 
@@ -201,7 +205,9 @@ namespace cAlgo.Robots
             double slPips = stopDistance / Symbol.PipSize;
             double? tpPips = RewardRiskRatio > 0 ? stopDistance * RewardRiskRatio / Symbol.PipSize : (double?)null;
 
-            ExecuteMarketOrder(type, SymbolName, volume, BotLabel, slPips, tpPips);
+            var result = ExecuteMarketOrder(type, SymbolName, volume, BotLabel, slPips, tpPips);
+            if (result.IsSuccessful)
+                _currentPosition = result.Position;
         }
     }
 }
