@@ -6,3 +6,5 @@ __pycache__
 .venv
 backtest/chart.html
 backtest/equity_curve.png
+backtest/chart_*.html
+backtest/data_*.csv
