@@ -68,7 +68,34 @@ namespace cAlgo.Robots
         private void OnPositionClosed(PositionClosedEventArgs args)
         {
             if (_currentPosition != null && args.Position.Id == _currentPosition.Id)
+            {
+                Print("OnPositionClosed: clearing tracked position {0}", _currentPosition.Id);
                 _currentPosition = null;
+            }
+        }
+
+        // Defensive reconciliation against the broker's actual position list,
+        // run every bar: drops tracking if our position is gone (however that
+        // happened) and adopts any stray same-label position we lost track of.
+        // Two earlier fixes (direction-filtered lookup, then identity tracking
+        // alone) both still produced duplicate same-direction positions in live
+        // backtests, so this no longer trusts internal state alone.
+        private void SyncPosition()
+        {
+            if (_currentPosition != null && !Positions.Any(p => p.Id == _currentPosition.Id))
+            {
+                Print("SyncPosition: tracked position {0} no longer exists, clearing", _currentPosition.Id);
+                _currentPosition = null;
+            }
+            if (_currentPosition == null)
+            {
+                var adopted = Positions.FirstOrDefault(p => p.SymbolName == SymbolName && p.Label == BotLabel);
+                if (adopted != null)
+                {
+                    Print("SyncPosition: adopting untracked position {0} ({1})", adopted.Id, adopted.TradeType);
+                    _currentPosition = adopted;
+                }
+            }
         }
 
         private void OnBarOpened(BarOpenedEventArgs args)
@@ -177,7 +204,9 @@ namespace cAlgo.Robots
         // pyramiding into duplicates. Object identity can't produce a false miss.
         private void ExecuteSignal()
         {
+            SyncPosition();
             TradeType? desiredType = _desiredDirection == 1 ? TradeType.Buy : _desiredDirection == -1 ? TradeType.Sell : (TradeType?)null;
+            Print("ExecuteSignal: desired={0} current={1}", _desiredDirection, _currentPosition != null ? _currentPosition.Id + "/" + _currentPosition.TradeType : "none");
 
             if (_currentPosition != null && (!desiredType.HasValue || _currentPosition.TradeType != desiredType.Value))
             {
