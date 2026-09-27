@@ -30,14 +30,25 @@ namespace cAlgo.Robots
         [Parameter("ATR Multiplier (stop distance)", DefaultValue = 2.0, MinValue = 0.1, Group = "Risk")]
         public double AtrMultiplier { get; set; }
 
-        [Parameter("Reward:Risk ratio (0 = no TP, rely on flip)", DefaultValue = 0.0, MinValue = 0, Group = "Risk")]
+        [Parameter("Reward:Risk ratio (0 = no TP, rely on flip)", DefaultValue = 3.0, MinValue = 0, Group = "Risk")]
         public double RewardRiskRatio { get; set; }
 
         [Parameter("Breakeven Trigger ($ profit, 0 = off)", DefaultValue = 500, MinValue = 0, Group = "Risk")]
         public double BreakEvenTriggerUsd { get; set; }
 
+        [Parameter("Use Trend Filter", DefaultValue = true, Group = "Trend Filter")]
+        public bool UseTrendFilter { get; set; }
+
+        [Parameter("Trend Timeframe", DefaultValue = "Daily", Group = "Trend Filter")]
+        public TimeFrame TrendTimeFrame { get; set; }
+
+        [Parameter("Trend EMA Period", DefaultValue = 50, MinValue = 2, Group = "Trend Filter")]
+        public int TrendEmaPeriod { get; set; }
+
         private const string BotLabel = "SmcBosChoch";
         private AverageTrueRange _atr;
+        private Bars _trendBars;
+        private MovingAverage _trendEma;
         private bool _breakEvenApplied;
 
         private enum SwingType { High = 1, Low = -1 }
@@ -63,8 +74,28 @@ namespace cAlgo.Robots
         protected override void OnStart()
         {
             _atr = Indicators.AverageTrueRange(AtrPeriod, MovingAverageType.WilderSmoothing);
+            if (UseTrendFilter)
+            {
+                _trendBars = MarketData.GetBars(TrendTimeFrame);
+                _trendEma = Indicators.MovingAverage(_trendBars.ClosePrices, TrendEmaPeriod, MovingAverageType.Exponential);
+            }
             Bars.BarOpened += OnBarOpened;
             Positions.Closed += OnPositionClosed;
+        }
+
+        // Higher-timeframe EMA trend filter: only allows entries in the
+        // direction price is trading relative to the EMA on TrendTimeFrame.
+        // Uses the last fully closed higher-TF bar (Count-2), not the still-
+        // forming one, to avoid checking against a value that can still change.
+        private bool MatchesTrend(TradeType type)
+        {
+            if (!UseTrendFilter) return true;
+            int idx = _trendBars.Count - 2;
+            if (idx < 0) return true;
+            double ma = _trendEma.Result[idx];
+            if (double.IsNaN(ma)) return true; // not enough higher-TF history yet
+            double price = _trendBars.ClosePrices[idx];
+            return type == TradeType.Buy ? price > ma : price < ma;
         }
 
         // Checked every tick (not just per-bar close) so a profit spike mid-bar
@@ -231,6 +262,13 @@ namespace cAlgo.Robots
         {
             SyncPosition();
             TradeType? desiredType = _desiredDirection == 1 ? TradeType.Buy : _desiredDirection == -1 ? TradeType.Sell : (TradeType?)null;
+
+            // trend filter only blocks NEW entries against the higher-TF trend;
+            // an existing position still exits on the opposite signal below, it
+            // just won't be replaced by a counter-trend one.
+            if (desiredType.HasValue && !MatchesTrend(desiredType.Value))
+                desiredType = null;
+
             Print("ExecuteSignal: desired={0} current={1}", _desiredDirection, _currentPosition != null ? _currentPosition.Id + "/" + _currentPosition.TradeType : "none");
 
             if (_currentPosition != null && (!desiredType.HasValue || _currentPosition.TradeType != desiredType.Value))
