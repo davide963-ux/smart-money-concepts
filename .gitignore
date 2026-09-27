@@ -4,3 +4,5 @@ smartmoneyconcepts.egg-info
 .DS_Store
 __pycache__
 .venv
+backtest/chart.html
+backtest/equity_curve.png
