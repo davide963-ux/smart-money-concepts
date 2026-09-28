@@ -78,9 +78,19 @@ namespace cAlgo.Robots
         [Parameter("Chop Filter Swing Count", DefaultValue = 3, MinValue = 2, Group = "Chop/Volatility Filter")]
         public int ChopFilterSwingCount { get; set; }
 
+        [Parameter("Use Overextension Filter", DefaultValue = true, Group = "Chop/Volatility Filter")]
+        public bool UseOverextensionFilter { get; set; }
+
+        [Parameter("Overextension MA Period", DefaultValue = 50, MinValue = 5, Group = "Chop/Volatility Filter")]
+        public int OverextensionMaPeriod { get; set; }
+
+        [Parameter("Max Overextension (ATR multiples, 0 = off)", DefaultValue = 3.0, MinValue = 0, Group = "Chop/Volatility Filter")]
+        public double MaxOverextensionAtr { get; set; }
+
         private const string BotLabel = "SmcBosChoch";
         private AverageTrueRange _atr;
         private MovingAverage _atrBaseline;
+        private MovingAverage _overextensionMa;
         private Bars _trendBars;
         private MovingAverage _trendEma;
         private double _peakProfit;
@@ -111,6 +121,8 @@ namespace cAlgo.Robots
             _atr = Indicators.AverageTrueRange(AtrPeriod, MovingAverageType.WilderSmoothing);
             if (UseAtrFilter)
                 _atrBaseline = Indicators.MovingAverage(_atr.Result, AtrBaselinePeriod, MovingAverageType.Simple);
+            if (UseOverextensionFilter)
+                _overextensionMa = Indicators.MovingAverage(Bars.ClosePrices, OverextensionMaPeriod, MovingAverageType.Simple);
             if (UseTrendFilter)
             {
                 _trendBars = MarketData.GetBars(TrendTimeFrame);
@@ -207,6 +219,28 @@ namespace cAlgo.Robots
         {
             for (int i = 1; i < values.Count; i++)
                 if (values[i] >= values[i - 1]) return false;
+            return true;
+        }
+
+        // How far price has already run from a longer-period moving average, in
+        // ATR multiples, in the trade's own direction (above the MA for a buy,
+        // below it for a sell). Catches a trade chasing a move that has already
+        // gone too far from its recent average - the failure mode the chop/ATR
+        // filters can't see, since the log showed a losing cluster with a
+        // genuinely clean trend swing structure and completely ordinary ATR.
+        // distanceAtr is always returned (even on a pass) for calibration from
+        // real logs, same as the ATR ratio filter.
+        private bool OverextensionAgrees(TradeType type, double atrValue, int barIndex, out double distanceAtr)
+        {
+            distanceAtr = double.NaN;
+            if (!UseOverextensionFilter) return true;
+            double ma = _overextensionMa.Result[barIndex];
+            if (double.IsNaN(ma) || atrValue <= 0) return true; // not enough history yet
+
+            double price = Bars.ClosePrices[barIndex];
+            distanceAtr = type == TradeType.Buy ? (price - ma) / atrValue : (ma - price) / atrValue;
+
+            if (MaxOverextensionAtr > 0 && distanceAtr > MaxOverextensionAtr) return false;
             return true;
         }
 
@@ -465,7 +499,14 @@ namespace cAlgo.Robots
                 return;
             }
 
-            Print("EntryFilters: {0} passed | ATR={1:F5} ratio={2:F2} | {3}", type, atrValue, atrRatio, chopDetail);
+            bool overextensionOk = OverextensionAgrees(type, atrValue, Bars.Count - 2, out double overextensionDistance);
+            if (!overextensionOk)
+            {
+                Print("SkipEntry: {0} blocked by overextension filter | distance={1:F2}x ATR from {2}-period MA", type, overextensionDistance, OverextensionMaPeriod);
+                return;
+            }
+
+            Print("EntryFilters: {0} passed | ATR={1:F5} ratio={2:F2} | {3} | overextension={4:F2}x ATR", type, atrValue, atrRatio, chopDetail, overextensionDistance);
 
             double stopDistance = atrValue * AtrMultiplier;
             double riskAmount = Account.Balance * RiskPercent / 100.0;
