@@ -66,10 +66,10 @@ namespace cAlgo.Robots
         [Parameter("ATR Baseline Period", DefaultValue = 50, MinValue = 5, Group = "Chop/Volatility Filter")]
         public int AtrBaselinePeriod { get; set; }
 
-        [Parameter("Min ATR Ratio vs baseline (0 = off)", DefaultValue = 0.5, MinValue = 0, Group = "Chop/Volatility Filter")]
+        [Parameter("Min ATR Ratio vs baseline (0 = off)", DefaultValue = 0.65, MinValue = 0, Group = "Chop/Volatility Filter")]
         public double MinAtrRatio { get; set; }
 
-        [Parameter("Max ATR Ratio vs baseline (0 = off)", DefaultValue = 2.5, MinValue = 0, Group = "Chop/Volatility Filter")]
+        [Parameter("Max ATR Ratio vs baseline (0 = off)", DefaultValue = 1.8, MinValue = 0, Group = "Chop/Volatility Filter")]
         public double MaxAtrRatio { get; set; }
 
         [Parameter("Use Chop/Trend-Structure Filter", DefaultValue = true, Group = "Chop/Volatility Filter")]
@@ -138,16 +138,18 @@ namespace cAlgo.Robots
         // Ratio of current ATR to its own AtrBaselinePeriod moving average, not an
         // absolute price-scale threshold - the same ratio band works on XAUUSD
         // (ATR in whole dollars) and EURUSD (ATR in pips) without retuning.
-        // Log analysis of the long-only backtest showed the two worst losing
-        // streaks sat at the ATR extremes: a flat-chop streak at ~0.4x baseline
-        // and a volatility-shock streak at ~3x baseline.
-        private bool AtrFilterAgrees(double atrValue, int barIndex)
+        // ratio is always returned (even when the filter is off or has no
+        // baseline yet, as NaN) so callers can log what was actually measured,
+        // not just whether it passed - a first version of this filter went 20
+        // months without tripping and there was no record of the near-misses.
+        private bool AtrFilterAgrees(double atrValue, int barIndex, out double ratio)
         {
+            ratio = double.NaN;
             if (!UseAtrFilter) return true;
             double baseline = _atrBaseline.Result[barIndex];
             if (double.IsNaN(baseline) || baseline <= 0) return true; // not enough history yet
 
-            double ratio = atrValue / baseline;
+            ratio = atrValue / baseline;
             if (MinAtrRatio > 0 && ratio < MinAtrRatio) return false;
             if (MaxAtrRatio > 0 && ratio > MaxAtrRatio) return false;
             return true;
@@ -159,9 +161,12 @@ namespace cAlgo.Robots
         // the long-only backtest happened at completely ordinary ATR - the common
         // thread was sideways/whipsaw structure, which this catches independently
         // of volatility.
-        private bool TrendStructureAgrees(int direction)
+        // detail always describes the swing values actually evaluated (even on a
+        // pass) - a first version only logged blocks, so there was no way to see
+        // why a losing-streak entry that SHOULD have looked choppy got through.
+        private bool TrendStructureAgrees(int direction, out string detail)
         {
-            if (!UseChopFilter) return true;
+            if (!UseChopFilter) { detail = "filter off"; return true; }
 
             var highs = new List<double>();
             var lows = new List<double>();
@@ -172,14 +177,23 @@ namespace cAlgo.Robots
                 else if (s.Type == SwingType.Low && lows.Count < ChopFilterSwingCount) lows.Add(s.Level);
             }
             if (highs.Count < ChopFilterSwingCount || lows.Count < ChopFilterSwingCount)
+            {
+                detail = "insufficient swing history";
                 return true; // not enough swing history yet, don't block
+            }
 
             highs.Reverse(); // collected newest-first, put back in chronological order
             lows.Reverse();
 
-            return direction == 1
+            bool agrees = direction == 1
                 ? IsStrictlyIncreasing(highs) && IsStrictlyIncreasing(lows)
                 : IsStrictlyDecreasing(highs) && IsStrictlyDecreasing(lows);
+
+            detail = string.Format(
+                "highs=[{0}] lows=[{1}]",
+                string.Join(",", highs.Select(h => h.ToString("F2"))),
+                string.Join(",", lows.Select(l => l.ToString("F2"))));
+            return agrees;
         }
 
         private static bool IsStrictlyIncreasing(List<double> values)
@@ -437,17 +451,21 @@ namespace cAlgo.Robots
             if (double.IsNaN(atrValue) || atrValue <= 0)
                 return; // not enough history yet to size a stop
 
-            if (!AtrFilterAgrees(atrValue, Bars.Count - 2))
+            bool atrOk = AtrFilterAgrees(atrValue, Bars.Count - 2, out double atrRatio);
+            if (!atrOk)
             {
-                Print("SkipEntry: {0} blocked by ATR filter | ATR={1:F5} baseline={2:F5}", type, atrValue, _atrBaseline.Result[Bars.Count - 2]);
+                Print("SkipEntry: {0} blocked by ATR filter | ATR={1:F5} ratio={2:F2}", type, atrValue, atrRatio);
                 return;
             }
 
-            if (!TrendStructureAgrees(type == TradeType.Buy ? 1 : -1))
+            bool chopOk = TrendStructureAgrees(type == TradeType.Buy ? 1 : -1, out string chopDetail);
+            if (!chopOk)
             {
-                Print("SkipEntry: {0} blocked by chop filter (no consistent higher-high/higher-low or lower-high/lower-low swing structure)", type);
+                Print("SkipEntry: {0} blocked by chop filter | {1}", type, chopDetail);
                 return;
             }
+
+            Print("EntryFilters: {0} passed | ATR={1:F5} ratio={2:F2} | {3}", type, atrValue, atrRatio, chopDetail);
 
             double stopDistance = atrValue * AtrMultiplier;
             double riskAmount = Account.Balance * RiskPercent / 100.0;
