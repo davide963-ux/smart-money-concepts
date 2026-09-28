@@ -39,8 +39,17 @@ namespace cAlgo.Robots
         [Parameter("Trailing Lock % of peak profit (0 = off)", DefaultValue = 10.0, MinValue = 0, Group = "Risk")]
         public double TrailingLockPercent { get; set; }
 
+        [Parameter("Giveback Min Profit ($, 0 = off)", DefaultValue = 2000, MinValue = 0, Group = "Risk")]
+        public double GivebackMinProfitUsd { get; set; }
+
+        [Parameter("Giveback Max %", DefaultValue = 40.0, MinValue = 0, MaxValue = 100, Group = "Risk")]
+        public double GivebackMaxPercent { get; set; }
+
         [Parameter("Max Hold (days, 0 = off)", DefaultValue = 5, MinValue = 0, Group = "Risk")]
         public int MaxHoldDays { get; set; }
+
+        [Parameter("Long Only", DefaultValue = false, Group = "Structure")]
+        public bool LongOnly { get; set; }
 
         [Parameter("Use Trend Filter", DefaultValue = false, Group = "Trend Filter")]
         public bool UseTrendFilter { get; set; }
@@ -106,13 +115,18 @@ namespace cAlgo.Robots
         }
 
         // Checked every tick (not just per-bar close) so a profit spike mid-bar
-        // isn't missed before it reverses. Combines two rules into one ratchet:
-        // breakeven once profit crosses BreakEvenTriggerUsd (locks $0), and a
-        // trailing lock of TrailingLockPercent of the highest profit ever seen
-        // on this position (locks progressively more as profit grows). Whichever
-        // of the two currently guarantees more is applied; the stop only ever
-        // moves to lock in MORE profit, never less - this ignores spread, so a
-        // fill right at the locked level can still cost a few points net.
+        // isn't missed before it reverses. Combines three rules into one ratchet:
+        // breakeven once profit crosses BreakEvenTriggerUsd (locks $0); a trailing
+        // lock of TrailingLockPercent of the highest profit ever seen (locks
+        // progressively as profit grows); and a giveback stop that only engages
+        // once peak profit passes GivebackMinProfitUsd, then caps how much of
+        // that peak can be given back (GivebackMaxPercent) - unlike the trailing
+        // lock, small/medium winners are left completely untouched below that
+        // floor, so it only targets the "ran to $12k, round-tripped to $0" case
+        // without clipping every winner early. Whichever rule currently
+        // guarantees the most is applied; the stop only ever moves to lock in
+        // MORE profit, never less - this ignores spread, so a fill right at the
+        // locked level can still cost a few points net.
         protected override void OnTick()
         {
             if (_currentPosition == null) return;
@@ -125,6 +139,8 @@ namespace cAlgo.Robots
                 desiredLock = Math.Max(desiredLock, 0.0);
             if (TrailingLockPercent > 0 && _peakProfit > 0)
                 desiredLock = Math.Max(desiredLock, _peakProfit * TrailingLockPercent / 100.0);
+            if (GivebackMinProfitUsd > 0 && _peakProfit >= GivebackMinProfitUsd)
+                desiredLock = Math.Max(desiredLock, _peakProfit * (1.0 - GivebackMaxPercent / 100.0));
 
             if (double.IsNegativeInfinity(desiredLock) || desiredLock <= _lockedProfitUsd)
                 return; // nothing more protective to apply yet
@@ -140,15 +156,21 @@ namespace cAlgo.Robots
             }
         }
 
-        // Catches SL/TP-triggered closes (not initiated by our own ClosePosition
-        // call) so _currentPosition never goes stale and causes a duplicate open.
+        // Fires for every close regardless of cause (our own signal-flip close,
+        // SL, TP, or a margin stop-out), so this is the single place that logs
+        // the real outcome of every trade - args.Reason says why it closed,
+        // Position.NetProfit is the actual realized $ result. Also catches
+        // SL/TP-triggered closes (not initiated by our own ClosePosition call)
+        // so _currentPosition never goes stale and causes a duplicate open.
         private void OnPositionClosed(PositionClosedEventArgs args)
         {
-            if (_currentPosition != null && args.Position.Id == _currentPosition.Id)
-            {
-                Print("OnPositionClosed: clearing tracked position {0}", _currentPosition.Id);
+            var p = args.Position;
+            Print(
+                "EXIT #{0}: {1} {2} closed | Reason={3} | NetProfit=${4:F2} | Entry={5} Exit-SL={6} Exit-TP={7} Volume={8}",
+                p.Id, p.TradeType, SymbolName, args.Reason, p.NetProfit, p.EntryPrice, p.StopLoss, p.TakeProfit, p.VolumeInUnits);
+
+            if (_currentPosition != null && p.Id == _currentPosition.Id)
                 _currentPosition = null;
-            }
         }
 
         // Defensive reconciliation against the broker's actual position list,
@@ -301,6 +323,11 @@ namespace cAlgo.Robots
             CheckMaxHold();
             TradeType? desiredType = _desiredDirection == 1 ? TradeType.Buy : _desiredDirection == -1 ? TradeType.Sell : (TradeType?)null;
 
+            // blocks new short entries only - an existing short still exits
+            // normally on the next opposite (bullish) signal below.
+            if (LongOnly && desiredType == TradeType.Sell)
+                desiredType = null;
+
             // trend filter only blocks NEW entries against the higher-TF trend;
             // an existing position still exits on the opposite signal below, it
             // just won't be replaced by a counter-trend one.
@@ -341,6 +368,11 @@ namespace cAlgo.Robots
                 _currentPosition = result.Position;
                 _peakProfit = 0;
                 _lockedProfitUsd = double.NegativeInfinity;
+
+                Print(
+                    "ENTRY #{0}: {1} {2} {3} units @ {4} | SL={5} TP={6} | ATR={7:F5} StopDist={8:F2} RiskAmt=${9:F2} Balance=${10:F2}",
+                    result.Position.Id, type, SymbolName, volume, result.Position.EntryPrice,
+                    result.Position.StopLoss, result.Position.TakeProfit, atrValue, stopDistance, riskAmount, Account.Balance);
             }
         }
     }
