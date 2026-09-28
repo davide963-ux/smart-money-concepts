@@ -78,7 +78,12 @@ namespace cAlgo.Robots
         [Parameter("Chop Filter Swing Count", DefaultValue = 3, MinValue = 2, Group = "Chop/Volatility Filter")]
         public int ChopFilterSwingCount { get; set; }
 
-        [Parameter("Use Overextension Filter", DefaultValue = true, Group = "Chop/Volatility Filter")]
+        // Off by default: confirmed to cost 17% of total profit while never
+        // blocking the entries that actually caused the target losing streak
+        // (their measured distance was 0.05-2.56x ATR, well under the
+        // threshold) - kept in code in case it's useful combined with other
+        // changes later, but not on by default until re-justified by data.
+        [Parameter("Use Overextension Filter", DefaultValue = false, Group = "Chop/Volatility Filter")]
         public bool UseOverextensionFilter { get; set; }
 
         [Parameter("Overextension MA Period", DefaultValue = 50, MinValue = 5, Group = "Chop/Volatility Filter")]
@@ -86,6 +91,15 @@ namespace cAlgo.Robots
 
         [Parameter("Max Overextension (ATR multiples, 0 = off)", DefaultValue = 3.0, MinValue = 0, Group = "Chop/Volatility Filter")]
         public double MaxOverextensionAtr { get; set; }
+
+        [Parameter("Use Loss Cooldown Filter", DefaultValue = true, Group = "Chop/Volatility Filter")]
+        public bool UseLossCooldownFilter { get; set; }
+
+        [Parameter("Consecutive Losses to Trigger Cooldown", DefaultValue = 3, MinValue = 1, Group = "Chop/Volatility Filter")]
+        public int CooldownLossThreshold { get; set; }
+
+        [Parameter("Cooldown Duration (bars)", DefaultValue = 10, MinValue = 1, Group = "Chop/Volatility Filter")]
+        public int CooldownBars { get; set; }
 
         private const string BotLabel = "SmcBosChoch";
         private AverageTrueRange _atr;
@@ -95,6 +109,15 @@ namespace cAlgo.Robots
         private MovingAverage _trendEma;
         private double _peakProfit;
         private double _lockedProfitUsd = double.NegativeInfinity; // highest profit level the SL currently guarantees
+
+        // Per-direction repeated-failure tracking, independent of market
+        // condition - chop and overextension filters both measured "normal"
+        // readings on the confirmed losing cluster, so this targets the
+        // observed behavior directly instead: pause new entries in a
+        // direction after it fails several times in a row, regardless of
+        // what the swings/ATR/MA say about that direction.
+        private readonly Dictionary<TradeType, int> _consecutiveLosses = new Dictionary<TradeType, int> { { TradeType.Buy, 0 }, { TradeType.Sell, 0 } };
+        private readonly Dictionary<TradeType, int> _cooldownUntilBar = new Dictionary<TradeType, int> { { TradeType.Buy, -1 }, { TradeType.Sell, -1 } };
 
         private enum SwingType { High = 1, Low = -1 }
 
@@ -301,6 +324,39 @@ namespace cAlgo.Robots
 
             if (_currentPosition != null && p.Id == _currentPosition.Id)
                 _currentPosition = null;
+
+            // -0.5 threshold matches how wins/losses/breakeven are classified
+            // everywhere else - a scratch/breakeven exit isn't a "failure" and
+            // resets the streak same as a win would.
+            if (p.NetProfit < -0.5)
+            {
+                _consecutiveLosses[p.TradeType]++;
+                if (UseLossCooldownFilter && _consecutiveLosses[p.TradeType] >= CooldownLossThreshold)
+                {
+                    _cooldownUntilBar[p.TradeType] = Bars.Count + CooldownBars;
+                    Print("LossCooldown: {0} hit {1} consecutive losses, pausing new {0} entries until bar {2}",
+                        p.TradeType, _consecutiveLosses[p.TradeType], _cooldownUntilBar[p.TradeType]);
+                }
+            }
+            else
+            {
+                _consecutiveLosses[p.TradeType] = 0;
+            }
+        }
+
+        // barsRemaining always reports how much cooldown is left (0 when clear)
+        // so it can be logged on every entry attempt, same discipline as the
+        // other filters.
+        private bool CooldownAgrees(TradeType type, out int barsRemaining)
+        {
+            barsRemaining = 0;
+            if (!UseLossCooldownFilter) return true;
+            int until = _cooldownUntilBar[type];
+            if (until < 0) return true;
+            int remaining = until - Bars.Count;
+            if (remaining <= 0) return true;
+            barsRemaining = remaining;
+            return false;
         }
 
         // Defensive reconciliation against the broker's actual position list,
@@ -506,7 +562,14 @@ namespace cAlgo.Robots
                 return;
             }
 
-            Print("EntryFilters: {0} passed | ATR={1:F5} ratio={2:F2} | {3} | overextension={4:F2}x ATR", type, atrValue, atrRatio, chopDetail, overextensionDistance);
+            bool cooldownOk = CooldownAgrees(type, out int cooldownBarsRemaining);
+            if (!cooldownOk)
+            {
+                Print("SkipEntry: {0} blocked by loss cooldown | {1} consecutive losses, {2} bars remaining", type, _consecutiveLosses[type], cooldownBarsRemaining);
+                return;
+            }
+
+            Print("EntryFilters: {0} passed | ATR={1:F5} ratio={2:F2} | {3} | overextension={4:F2}x ATR | consecutiveLosses={5}", type, atrValue, atrRatio, chopDetail, overextensionDistance, _consecutiveLosses[type]);
 
             double stopDistance = atrValue * AtrMultiplier;
             double riskAmount = Account.Balance * RiskPercent / 100.0;
