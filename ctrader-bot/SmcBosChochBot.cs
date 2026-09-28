@@ -60,8 +60,27 @@ namespace cAlgo.Robots
         [Parameter("Trend EMA Period", DefaultValue = 50, MinValue = 2, Group = "Trend Filter")]
         public int TrendEmaPeriod { get; set; }
 
+        [Parameter("Use ATR Volatility Filter", DefaultValue = true, Group = "Chop/Volatility Filter")]
+        public bool UseAtrFilter { get; set; }
+
+        [Parameter("ATR Baseline Period", DefaultValue = 50, MinValue = 5, Group = "Chop/Volatility Filter")]
+        public int AtrBaselinePeriod { get; set; }
+
+        [Parameter("Min ATR Ratio vs baseline (0 = off)", DefaultValue = 0.5, MinValue = 0, Group = "Chop/Volatility Filter")]
+        public double MinAtrRatio { get; set; }
+
+        [Parameter("Max ATR Ratio vs baseline (0 = off)", DefaultValue = 2.5, MinValue = 0, Group = "Chop/Volatility Filter")]
+        public double MaxAtrRatio { get; set; }
+
+        [Parameter("Use Chop/Trend-Structure Filter", DefaultValue = true, Group = "Chop/Volatility Filter")]
+        public bool UseChopFilter { get; set; }
+
+        [Parameter("Chop Filter Swing Count", DefaultValue = 3, MinValue = 2, Group = "Chop/Volatility Filter")]
+        public int ChopFilterSwingCount { get; set; }
+
         private const string BotLabel = "SmcBosChoch";
         private AverageTrueRange _atr;
+        private MovingAverage _atrBaseline;
         private Bars _trendBars;
         private MovingAverage _trendEma;
         private double _peakProfit;
@@ -90,6 +109,8 @@ namespace cAlgo.Robots
         protected override void OnStart()
         {
             _atr = Indicators.AverageTrueRange(AtrPeriod, MovingAverageType.WilderSmoothing);
+            if (UseAtrFilter)
+                _atrBaseline = Indicators.MovingAverage(_atr.Result, AtrBaselinePeriod, MovingAverageType.Simple);
             if (UseTrendFilter)
             {
                 _trendBars = MarketData.GetBars(TrendTimeFrame);
@@ -112,6 +133,67 @@ namespace cAlgo.Robots
             if (double.IsNaN(ma)) return true; // not enough higher-TF history yet
             double price = _trendBars.ClosePrices[idx];
             return type == TradeType.Buy ? price > ma : price < ma;
+        }
+
+        // Ratio of current ATR to its own AtrBaselinePeriod moving average, not an
+        // absolute price-scale threshold - the same ratio band works on XAUUSD
+        // (ATR in whole dollars) and EURUSD (ATR in pips) without retuning.
+        // Log analysis of the long-only backtest showed the two worst losing
+        // streaks sat at the ATR extremes: a flat-chop streak at ~0.4x baseline
+        // and a volatility-shock streak at ~3x baseline.
+        private bool AtrFilterAgrees(double atrValue, int barIndex)
+        {
+            if (!UseAtrFilter) return true;
+            double baseline = _atrBaseline.Result[barIndex];
+            if (double.IsNaN(baseline) || baseline <= 0) return true; // not enough history yet
+
+            double ratio = atrValue / baseline;
+            if (MinAtrRatio > 0 && ratio < MinAtrRatio) return false;
+            if (MaxAtrRatio > 0 && ratio > MaxAtrRatio) return false;
+            return true;
+        }
+
+        // Requires the last ChopFilterSwingCount swing highs AND swing lows to be
+        // strictly monotonic in the trade's direction (higher highs + higher lows
+        // for a buy, lower highs + lower lows for a sell). Most losing streaks in
+        // the long-only backtest happened at completely ordinary ATR - the common
+        // thread was sideways/whipsaw structure, which this catches independently
+        // of volatility.
+        private bool TrendStructureAgrees(int direction)
+        {
+            if (!UseChopFilter) return true;
+
+            var highs = new List<double>();
+            var lows = new List<double>();
+            for (int i = _swings.Count - 1; i >= 0 && (highs.Count < ChopFilterSwingCount || lows.Count < ChopFilterSwingCount); i--)
+            {
+                var s = _swings[i];
+                if (s.Type == SwingType.High && highs.Count < ChopFilterSwingCount) highs.Add(s.Level);
+                else if (s.Type == SwingType.Low && lows.Count < ChopFilterSwingCount) lows.Add(s.Level);
+            }
+            if (highs.Count < ChopFilterSwingCount || lows.Count < ChopFilterSwingCount)
+                return true; // not enough swing history yet, don't block
+
+            highs.Reverse(); // collected newest-first, put back in chronological order
+            lows.Reverse();
+
+            return direction == 1
+                ? IsStrictlyIncreasing(highs) && IsStrictlyIncreasing(lows)
+                : IsStrictlyDecreasing(highs) && IsStrictlyDecreasing(lows);
+        }
+
+        private static bool IsStrictlyIncreasing(List<double> values)
+        {
+            for (int i = 1; i < values.Count; i++)
+                if (values[i] <= values[i - 1]) return false;
+            return true;
+        }
+
+        private static bool IsStrictlyDecreasing(List<double> values)
+        {
+            for (int i = 1; i < values.Count; i++)
+                if (values[i] >= values[i - 1]) return false;
+            return true;
         }
 
         // Checked every tick (not just per-bar close) so a profit spike mid-bar
@@ -354,6 +436,18 @@ namespace cAlgo.Robots
             double atrValue = _atr.Result[Bars.Count - 2];
             if (double.IsNaN(atrValue) || atrValue <= 0)
                 return; // not enough history yet to size a stop
+
+            if (!AtrFilterAgrees(atrValue, Bars.Count - 2))
+            {
+                Print("SkipEntry: {0} blocked by ATR filter | ATR={1:F5} baseline={2:F5}", type, atrValue, _atrBaseline.Result[Bars.Count - 2]);
+                return;
+            }
+
+            if (!TrendStructureAgrees(type == TradeType.Buy ? 1 : -1))
+            {
+                Print("SkipEntry: {0} blocked by chop filter (no consistent higher-high/higher-low or lower-high/lower-low swing structure)", type);
+                return;
+            }
 
             double stopDistance = atrValue * AtrMultiplier;
             double riskAmount = Account.Balance * RiskPercent / 100.0;
