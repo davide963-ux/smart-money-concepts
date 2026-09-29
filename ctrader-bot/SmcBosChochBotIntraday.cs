@@ -64,14 +64,28 @@ namespace cAlgo.Robots
         [Parameter("Reward:Risk ratio (0 = no TP, rely on flip)", DefaultValue = 3.0, MinValue = 0, Group = "Risk")]
         public double RewardRiskRatio { get; set; }
 
-        [Parameter("Breakeven Trigger ($ profit, 0 = off)", DefaultValue = 500, MinValue = 0, Group = "Risk")]
-        public double BreakEvenTriggerUsd { get; set; }
+        // Expressed as multiples of the TRADE'S OWN risk amount (RiskPercent x
+        // balance at entry), not fixed dollars like the H4 file - fixed-$
+        // thresholds tuned for a $100k account with $500-1000+ typical risk
+        // silently broke at $10k/$20-risk scale: Breakeven/Giveback almost
+        // never fired (thresholds 25-100x the actual risk), while
+        // TrailingLockPercent has no floor at all and fired on literal cents
+        // of peak profit, confirmed in a real log (SL yanked to near-entry 2
+        // minutes after open on a $0.63 peak, stopped out 9 minutes later).
+        [Parameter("Breakeven Trigger (x risk amount, 0 = off)", DefaultValue = 1.0, MinValue = 0, Group = "Risk")]
+        public double BreakEvenTriggerRiskMultiple { get; set; }
+
+        // The floor TrailingLockPercent never had on the H4 file - without
+        // this, the ratchet engages the instant peak profit is positive at
+        // any account/risk scale where that "$1 of profit" is not noise-sized.
+        [Parameter("Trailing Lock Min Profit (x risk amount, 0 = off)", DefaultValue = 0.5, MinValue = 0, Group = "Risk")]
+        public double TrailingLockMinRiskMultiple { get; set; }
 
         [Parameter("Trailing Lock % of peak profit (0 = off)", DefaultValue = 10.0, MinValue = 0, Group = "Risk")]
         public double TrailingLockPercent { get; set; }
 
-        [Parameter("Giveback Min Profit ($, 0 = off)", DefaultValue = 2000, MinValue = 0, Group = "Risk")]
-        public double GivebackMinProfitUsd { get; set; }
+        [Parameter("Giveback Min Profit (x risk amount, 0 = off)", DefaultValue = 3.0, MinValue = 0, Group = "Risk")]
+        public double GivebackMinProfitRiskMultiple { get; set; }
 
         [Parameter("Giveback Max %", DefaultValue = 40.0, MinValue = 0, MaxValue = 100, Group = "Risk")]
         public double GivebackMaxPercent { get; set; }
@@ -140,6 +154,7 @@ namespace cAlgo.Robots
         private MovingAverage _trendEma;
         private double _peakProfit;
         private double _lockedProfitUsd = double.NegativeInfinity; // highest profit level the SL currently guarantees
+        private double _currentRiskAmount; // $ risked on the open position, set at entry - scales the protection thresholds below
 
         // Per-direction repeated-failure tracking, independent of market
         // condition - see OverextensionAgrees/TrendStructureAgrees comments
@@ -300,27 +315,35 @@ namespace cAlgo.Robots
 
         // Checked every tick (not just per-bar close) so a profit spike mid-bar
         // isn't missed before it reverses. Combines three rules into one ratchet:
-        // breakeven once profit crosses BreakEvenTriggerUsd (locks $0); a trailing
-        // lock of TrailingLockPercent of the highest profit ever seen; and a
-        // giveback stop that only engages once peak profit passes
-        // GivebackMinProfitUsd, then caps how much of that peak can be given
-        // back (GivebackMaxPercent). Whichever rule currently guarantees the
-        // most is applied; the stop only ever moves to lock in MORE profit,
-        // never less - this ignores spread, so a fill right at the locked
-        // level can still cost a few points net.
+        // breakeven once profit crosses BreakEvenTriggerRiskMultiple x the
+        // trade's own risk amount (locks $0); a trailing lock of
+        // TrailingLockPercent of the highest profit ever seen, but only once
+        // that peak clears TrailingLockMinRiskMultiple x risk (the floor the
+        // H4 file's version never had - without it this fires on literal
+        // cents of peak profit); and a giveback stop that only engages once
+        // peak profit passes GivebackMinProfitRiskMultiple x risk, then caps
+        // how much of that peak can be given back (GivebackMaxPercent).
+        // Whichever rule currently guarantees the most is applied; the stop
+        // only ever moves to lock in MORE profit, never less - this ignores
+        // spread, so a fill right at the locked level can still cost a few
+        // points net.
         protected override void OnTick()
         {
-            if (_currentPosition == null) return;
+            if (_currentPosition == null || _currentRiskAmount <= 0) return;
 
             double profit = _currentPosition.NetProfit;
             _peakProfit = Math.Max(_peakProfit, profit);
 
+            double breakEvenTrigger = BreakEvenTriggerRiskMultiple * _currentRiskAmount;
+            double trailingLockFloor = TrailingLockMinRiskMultiple * _currentRiskAmount;
+            double givebackMinProfit = GivebackMinProfitRiskMultiple * _currentRiskAmount;
+
             double desiredLock = double.NegativeInfinity;
-            if (BreakEvenTriggerUsd > 0 && profit >= BreakEvenTriggerUsd)
+            if (BreakEvenTriggerRiskMultiple > 0 && profit >= breakEvenTrigger)
                 desiredLock = Math.Max(desiredLock, 0.0);
-            if (TrailingLockPercent > 0 && _peakProfit > 0)
+            if (TrailingLockPercent > 0 && _peakProfit >= trailingLockFloor)
                 desiredLock = Math.Max(desiredLock, _peakProfit * TrailingLockPercent / 100.0);
-            if (GivebackMinProfitUsd > 0 && _peakProfit >= GivebackMinProfitUsd)
+            if (GivebackMinProfitRiskMultiple > 0 && _peakProfit >= givebackMinProfit)
                 desiredLock = Math.Max(desiredLock, _peakProfit * (1.0 - GivebackMaxPercent / 100.0));
 
             if (double.IsNegativeInfinity(desiredLock) || desiredLock <= _lockedProfitUsd)
@@ -402,6 +425,14 @@ namespace cAlgo.Robots
                     _currentPosition = adopted;
                     _peakProfit = 0;
                     _lockedProfitUsd = double.NegativeInfinity;
+                    // Approximated from the position's current stop distance since
+                    // we didn't open it ourselves and don't know its intended risk;
+                    // taken at adoption time, before our own ratchet can have moved
+                    // it. No stop set at all -> 0, which just skips the ratchet
+                    // (OnTick's guard) until the position is closed and reopened by us.
+                    _currentRiskAmount = adopted.StopLoss.HasValue
+                        ? Math.Abs(adopted.EntryPrice - adopted.StopLoss.Value) * adopted.VolumeInUnits
+                        : 0;
                 }
             }
         }
@@ -614,6 +645,7 @@ namespace cAlgo.Robots
                 _currentPosition = result.Position;
                 _peakProfit = 0;
                 _lockedProfitUsd = double.NegativeInfinity;
+                _currentRiskAmount = riskAmount;
 
                 Print(
                     "ENTRY #{0}: {1} {2} {3} units @ {4} | SL={5} TP={6} | ATR={7:F5} StopDist={8:F2} RiskAmt=${9:F2} Balance=${10:F2}",
