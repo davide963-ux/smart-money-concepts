@@ -143,6 +143,12 @@ namespace cAlgo.Robots
         [Parameter("Cooldown Duration (bars)", DefaultValue = 10, MinValue = 1, Group = "Chop/Volatility Filter")]
         public int CooldownBars { get; set; }
 
+        // Requires an unmitigated order block in the trade's direction to
+        // exist before allowing the entry - see OrderBlockAgrees for what
+        // "exists" means here (direction-existence, not price-inside-zone).
+        [Parameter("Use Order Block Filter", DefaultValue = true, Group = "Chop/Volatility Filter")]
+        public bool UseOrderBlockFilter { get; set; }
+
         // Distinct from the H4 bot's "SmcBosChoch" label so SyncPosition below
         // can never adopt a position opened by the other bot if both are ever
         // run on the same account/symbol.
@@ -175,9 +181,28 @@ namespace cAlgo.Robots
         {
             public int Direction; // 1 = bullish, -1 = bearish
             public double Level;
+            public int SwingIndex; // bar index of the swing point this break is measured against - locates the order block candle once confirmed
+        }
+
+        // Ported from smartmoneyconcepts/smc.py's ob(): an order block is the
+        // most extreme opposite-direction candle between a swing point and the
+        // bar whose close breaks past it - the last real footprint of the
+        // losing side before the move that invalidated it. Simplified from the
+        // Python version: no volume-based Percentage/OBVolume scoring (not
+        // essential for a direction-existence confluence check) and a single
+        // mitigated flag instead of the two-stage breaker/removal logic (once
+        // price has closed back through it, it's used up for this purpose).
+        private class OrderBlock
+        {
+            public int Direction; // 1 = bullish, -1 = bearish
+            public double Top;
+            public double Bottom;
+            public int FormedIndex;
+            public bool Mitigated;
         }
 
         private readonly List<SwingPoint> _swings = new List<SwingPoint>();
+        private readonly List<OrderBlock> _orderBlocks = new List<OrderBlock>();
         private PendingStructure _pending;
         private int _desiredDirection; // -1, 0, 1
         private Position _currentPosition; // the exact position this bot opened, or null
@@ -460,6 +485,7 @@ namespace cAlgo.Robots
                 return;
 
             DetectSwing(candidate);
+            UpdateOrderBlocks(closedIndex);
             CheckPendingBreak(closedIndex);
             ExecuteSignal();
         }
@@ -533,7 +559,7 @@ namespace cAlgo.Robots
             }
 
             if (direction != null)
-                _pending = new PendingStructure { Direction = direction.Value, Level = lv[1] };
+                _pending = new PendingStructure { Direction = direction.Value, Level = lv[1], SwingIndex = p[1].Index };
         }
 
         private void CheckPendingBreak(int closedIndex)
@@ -547,8 +573,92 @@ namespace cAlgo.Robots
             bool broke = _pending.Direction == 1 ? price > _pending.Level : price < _pending.Level;
             if (!broke) return;
 
+            FormOrderBlock(_pending.Direction, _pending.SwingIndex, closedIndex);
+
             _desiredDirection = _pending.Direction;
             _pending = null;
+        }
+
+        // Ports smc.py's ob() candle-selection: searches the bars between the
+        // swing point being broken and the confirming bar for the most
+        // extreme opposite-direction candle (lowest low for a bullish break,
+        // highest high for a bearish one) - ties go to the LAST such candle,
+        // matching the Python version. Falls back to the candle right before
+        // the break when there's nothing in between (a same-bar/next-bar
+        // break). Deviates from the Python reference's default-case values
+        // (which assign candle high to Bottom and low to Top - looks like a
+        // latent quirk in the source library) by using that candle's own
+        // High/Low as Top/Bottom directly, which is always sane.
+        private void FormOrderBlock(int direction, int swingIndex, int breakIndex)
+        {
+            int obIndex = breakIndex - 1;
+            if (breakIndex - swingIndex > 1)
+            {
+                int extremeIndex = swingIndex + 1;
+                for (int k = swingIndex + 1; k < breakIndex; k++)
+                {
+                    bool moreOrEquallyExtreme = direction == 1
+                        ? Bars.LowPrices[k] <= Bars.LowPrices[extremeIndex]
+                        : Bars.HighPrices[k] >= Bars.HighPrices[extremeIndex];
+                    if (moreOrEquallyExtreme)
+                        extremeIndex = k;
+                }
+                obIndex = extremeIndex;
+            }
+
+            _orderBlocks.Add(new OrderBlock
+            {
+                Direction = direction,
+                Top = Bars.HighPrices[obIndex],
+                Bottom = Bars.LowPrices[obIndex],
+                FormedIndex = obIndex,
+                Mitigated = false
+            });
+
+            // Bound memory - old mitigated/irrelevant blocks just accumulate otherwise.
+            if (_orderBlocks.Count > 200)
+                _orderBlocks.RemoveRange(0, _orderBlocks.Count - 200);
+        }
+
+        // A bullish OB is used up once price closes back below the low of the
+        // candle that formed it; a bearish OB once price closes back above
+        // its high. Single-stage, unlike smc.py's two-stage breaker/removal -
+        // for a confluence check, "already revisited once" is enough to stop
+        // treating it as fresh support.
+        private void UpdateOrderBlocks(int closedIndex)
+        {
+            foreach (var ob in _orderBlocks)
+            {
+                if (ob.Mitigated) continue;
+                bool invalidated = ob.Direction == 1
+                    ? Bars.LowPrices[closedIndex] < ob.Bottom
+                    : Bars.HighPrices[closedIndex] > ob.Top;
+                if (invalidated)
+                    ob.Mitigated = true;
+            }
+        }
+
+        // Existence check, not a price-inside-zone check: requires an
+        // unmitigated order block in the trade's direction, formed before
+        // this signal, confirming the break is backed by a genuine
+        // institutional footprint rather than an isolated swing with nothing
+        // behind it. A stricter version - wait for price to retrace back
+        // INTO the zone before entering - would need a pending-entry state
+        // machine instead of firing at confirmation time; this is the
+        // simpler reading, not that one.
+        private bool OrderBlockAgrees(int direction, out string detail)
+        {
+            if (!UseOrderBlockFilter) { detail = "filter off"; return true; }
+
+            for (int i = _orderBlocks.Count - 1; i >= 0; i--)
+            {
+                var ob = _orderBlocks[i];
+                if (ob.Mitigated || ob.Direction != direction) continue;
+                detail = string.Format("OB @ bar {0} [{1:F2}-{2:F2}]", ob.FormedIndex, ob.Bottom, ob.Top);
+                return true;
+            }
+            detail = "no unmitigated order block in this direction";
+            return false;
         }
 
         // Uses _currentPosition (the exact object handed back by our own order
@@ -630,7 +740,14 @@ namespace cAlgo.Robots
                 return;
             }
 
-            Print("EntryFilters: {0} passed | ATR={1:F5} ratio={2:F2} | {3} | overextension={4:F2}x ATR | consecutiveLosses={5}", type, atrValue, atrRatio, chopDetail, overextensionDistance, _consecutiveLosses[type]);
+            bool obOk = OrderBlockAgrees(type == TradeType.Buy ? 1 : -1, out string obDetail);
+            if (!obOk)
+            {
+                Print("SkipEntry: {0} blocked by order block filter | {1}", type, obDetail);
+                return;
+            }
+
+            Print("EntryFilters: {0} passed | ATR={1:F5} ratio={2:F2} | {3} | overextension={4:F2}x ATR | consecutiveLosses={5} | {6}", type, atrValue, atrRatio, chopDetail, overextensionDistance, _consecutiveLosses[type], obDetail);
 
             double stopDistance = atrValue * AtrMultiplier;
             double riskAmount = Account.Balance * RiskPercent / 100.0;
