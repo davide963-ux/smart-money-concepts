@@ -28,7 +28,12 @@ namespace cAlgo.Robots
     [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
     public class SmcBosChochBotIntraday : Robot
     {
-        [Parameter("Swing Length", DefaultValue = 8, MinValue = 2, Group = "Structure")]
+        // Bumped from 8 after the first M15 backtest: 93.3% of trades hit
+        // their stop, median hold time was 7 minutes, and two-thirds closed
+        // within a single bar - a window this small was confirming BOS/CHOCH
+        // off swings barely bigger than noise. 20 is a substantial jump, not
+        // a fine-tune, since the first value failed badly; still unvalidated.
+        [Parameter("Swing Length", DefaultValue = 20, MinValue = 2, Group = "Structure")]
         public int SwingLength { get; set; }
 
         [Parameter("Close Break", DefaultValue = true, Group = "Structure")]
