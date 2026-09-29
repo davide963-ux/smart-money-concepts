@@ -205,6 +205,7 @@ namespace cAlgo.Robots
         private readonly List<OrderBlock> _orderBlocks = new List<OrderBlock>();
         private PendingStructure _pending;
         private int _desiredDirection; // -1, 0, 1
+        private bool _priorObSupport; // snapshotted alongside _desiredDirection at confirmation time - see CheckPendingBreak
         private Position _currentPosition; // the exact position this bot opened, or null
 
         protected override void OnStart()
@@ -573,10 +574,28 @@ namespace cAlgo.Robots
             bool broke = _pending.Direction == 1 ? price > _pending.Level : price < _pending.Level;
             if (!broke) return;
 
+            // Snapshot BEFORE forming this break's own order block below - an
+            // earlier version checked confluence against the list AFTER
+            // FormOrderBlock had already added this break's own block to it,
+            // which is tautological (a fresh break always forms a matching-
+            // direction block, so the check could never fail). Confirmed via
+            // a real log: the "supporting" OB was always the one just formed
+            // by that same break, never an earlier, independent one.
+            _priorObSupport = HasUnmitigatedOrderBlock(_pending.Direction);
             FormOrderBlock(_pending.Direction, _pending.SwingIndex, closedIndex);
 
             _desiredDirection = _pending.Direction;
             _pending = null;
+        }
+
+        private bool HasUnmitigatedOrderBlock(int direction)
+        {
+            for (int i = _orderBlocks.Count - 1; i >= 0; i--)
+            {
+                var ob = _orderBlocks[i];
+                if (!ob.Mitigated && ob.Direction == direction) return true;
+            }
+            return false;
         }
 
         // Ports smc.py's ob() candle-selection: searches the bars between the
@@ -639,26 +658,20 @@ namespace cAlgo.Robots
         }
 
         // Existence check, not a price-inside-zone check: requires an
-        // unmitigated order block in the trade's direction, formed before
-        // this signal, confirming the break is backed by a genuine
-        // institutional footprint rather than an isolated swing with nothing
-        // behind it. A stricter version - wait for price to retrace back
-        // INTO the zone before entering - would need a pending-entry state
-        // machine instead of firing at confirmation time; this is the
-        // simpler reading, not that one.
-        private bool OrderBlockAgrees(int direction, out string detail)
+        // unmitigated order block in the trade's direction that already
+        // existed BEFORE this break confirmed (_priorObSupport, snapshotted
+        // in CheckPendingBreak - see the comment there for why it can't be
+        // re-checked against the live list here). Confirms the break is
+        // backed by an earlier, independent institutional footprint rather
+        // than an isolated swing with nothing behind it. A stricter version -
+        // wait for price to retrace back INTO the zone before entering -
+        // would need a pending-entry state machine instead of firing at
+        // confirmation time; this is the simpler reading, not that one.
+        private bool OrderBlockAgrees(out string detail)
         {
             if (!UseOrderBlockFilter) { detail = "filter off"; return true; }
-
-            for (int i = _orderBlocks.Count - 1; i >= 0; i--)
-            {
-                var ob = _orderBlocks[i];
-                if (ob.Mitigated || ob.Direction != direction) continue;
-                detail = string.Format("OB @ bar {0} [{1:F2}-{2:F2}]", ob.FormedIndex, ob.Bottom, ob.Top);
-                return true;
-            }
-            detail = "no unmitigated order block in this direction";
-            return false;
+            detail = _priorObSupport ? "prior unmitigated OB existed at confirmation" : "no prior unmitigated OB at confirmation";
+            return _priorObSupport;
         }
 
         // Uses _currentPosition (the exact object handed back by our own order
@@ -740,7 +753,7 @@ namespace cAlgo.Robots
                 return;
             }
 
-            bool obOk = OrderBlockAgrees(type == TradeType.Buy ? 1 : -1, out string obDetail);
+            bool obOk = OrderBlockAgrees(out string obDetail);
             if (!obOk)
             {
                 Print("SkipEntry: {0} blocked by order block filter | {1}", type, obDetail);
